@@ -1,4 +1,4 @@
-// Copyright 2021 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,128 +14,300 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
+	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus-community/postgres_exporter/collector"
+	"github.com/prometheus-community/postgres_exporter/config"
+	"github.com/prometheus-community/postgres_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
+	prometheuscollectors "github.com/prometheus/client_golang/prometheus/collectors"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/promlog"
-	"github.com/prometheus/common/promlog/flag"
+	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/common/promslog/flag"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
-	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
 )
 
 var (
-	listenAddress          = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9187").Envar("PG_EXPORTER_WEB_LISTEN_ADDRESS").String()
-	webConfig              = webflag.AddFlags(kingpin.CommandLine)
-	metricPath             = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").Envar("PG_EXPORTER_WEB_TELEMETRY_PATH").String()
-	disableDefaultMetrics  = kingpin.Flag("disable-default-metrics", "Do not include default metrics.").Default("false").Envar("PG_EXPORTER_DISABLE_DEFAULT_METRICS").Bool()
-	disableSettingsMetrics = kingpin.Flag("disable-settings-metrics", "Do not include pg_settings metrics.").Default("false").Envar("PG_EXPORTER_DISABLE_SETTINGS_METRICS").Bool()
-	autoDiscoverDatabases  = kingpin.Flag("auto-discover-databases", "Whether to discover the databases on a server dynamically.").Default("false").Envar("PG_EXPORTER_AUTO_DISCOVER_DATABASES").Bool()
-	queriesPath            = kingpin.Flag("extend.query-path", "Path to custom queries to run.").Default("").Envar("PG_EXPORTER_EXTEND_QUERY_PATH").String()
-	onlyDumpMaps           = kingpin.Flag("dumpmaps", "Do not run, simply dump the maps.").Bool()
-	constantLabelsList     = kingpin.Flag("constantLabels", "A list of label=value separated by comma(,).").Default("").Envar("PG_EXPORTER_CONSTANT_LABELS").String()
-	excludeDatabases       = kingpin.Flag("exclude-databases", "A list of databases to remove when autoDiscoverDatabases is enabled").Default("").Envar("PG_EXPORTER_EXCLUDE_DATABASES").String()
-	includeDatabases       = kingpin.Flag("include-databases", "A list of databases to include when autoDiscoverDatabases is enabled").Default("").Envar("PG_EXPORTER_INCLUDE_DATABASES").String()
-	metricPrefix           = kingpin.Flag("metric-prefix", "A metric prefix can be used to have non-default (not \"pg\") prefixes for each of the metrics").Default("pg").Envar("PG_EXPORTER_METRIC_PREFIX").String()
-	logger                 = log.NewNopLogger()
+	configFile                          = kingpin.Flag("config.file", "Postgres exporter configuration file.").Default("postgres_exporter.yml").String()
+	webConfig                           = kingpinflag.AddFlags(kingpin.CommandLine, ":9187")
+	metricsPath                         = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").Envar("PG_EXPORTER_WEB_TELEMETRY_PATH").String()
+	disableDefaultMetrics               = kingpin.Flag("disable-default-metrics", "Do not include default metrics.").Default("false").Envar("PG_EXPORTER_DISABLE_DEFAULT_METRICS").Bool()
+	autoDiscoverDatabases               = kingpin.Flag("auto-discover-databases", "Whether to discover the databases on a server dynamically. (DEPRECATED)").Default("false").Envar("PG_EXPORTER_AUTO_DISCOVER_DATABASES").Bool()
+	autoDiscoverDatabasesMaxConcurrency = kingpin.Flag("auto-discover-databases.max-concurrency", "Maximum number of discovered databases to scrape concurrently in a single scrape.").Default(fmt.Sprintf("%d", config.DefaultAutoDiscoverDatabasesMaxConcurrency)).Int()
+	queriesPath                         = kingpin.Flag("extend.query-path", "Path to custom queries to run. (DEPRECATED)").Default("").Envar("PG_EXPORTER_EXTEND_QUERY_PATH").String()
+	onlyDumpMaps                        = kingpin.Flag("dumpmaps", "Do not run, simply dump the maps.").Bool()
+	constantLabelsList                  = kingpin.Flag("constantLabels", "A list of label=value separated by comma(,). (DEPRECATED)").Default("").Envar("PG_EXPORTER_CONSTANT_LABELS").String()
+	excludeDatabases                    = kingpin.Flag("exclude-databases", "A list of databases to remove when autoDiscoverDatabases is enabled (DEPRECATED)").Default("").Envar("PG_EXPORTER_EXCLUDE_DATABASES").String()
+	includeDatabases                    = kingpin.Flag("include-databases", "A list of databases to include when autoDiscoverDatabases is enabled (DEPRECATED)").Default("").Envar("PG_EXPORTER_INCLUDE_DATABASES").String()
+	metricPrefix                        = kingpin.Flag("metric-prefix", "A metric prefix can be used to have non-default (not \"pg\") prefixes for each of the metrics").Default("pg").Envar("PG_EXPORTER_METRIC_PREFIX").String()
+	collectionTimeout                   = kingpin.Flag("collection-timeout", "Timeout for collecting the statistics when the database is slow").Default("1m").Envar("PG_EXPORTER_COLLECTION_TIMEOUT").String()
+	wrapLargeCounters                   = kingpin.Flag("wrap-large-counters", "Wrap 64-bit counters at 2^53 to avoid floating point rounding.").Default("true").Bool()
+	datasourceURI                       = kingpin.Flag("datasource.uri", "Data source URI, in host:port/dbname form.").Default("").String()
+	datasourceURIFile                   = kingpin.Flag("datasource.uri-file", "Path to a file containing the data source URI. Takes precedence over datasource.uri.").Default("").String()
+	datasourceUserFile                  = kingpin.Flag("datasource.user-file", "Path to a file containing the data source user name.").Default("").String()
+	datasourcePassFile                  = kingpin.Flag("datasource.pass-file", "Path to a file containing the data source password.").Default("").String()
+	collectorFlags                      = newCollectorFlags()
+
+	longRunningTransactionsThreshold = kingpin.Flag(
+		"collector.long_running_transactions.threshold",
+		"Minimum transaction duration to consider long running.",
+	).Default(config.DefaultLongRunningTransactionsThreshold.String()).Duration()
+
+	statStatementsFlags = newPGStatStatementsFlags()
+	logger              = promslog.NewNopLogger()
 )
 
-// Metric name parts.
-const (
-	// Namespace for all metrics.
-	namespace = "pg"
-	// Subsystems.
-	exporter = "exporter"
-	// The name of the exporter.
-	exporterName = "postgres_exporter"
-	// Metric label used for static string data thats handy to send to Prometheus
-	// e.g. version
-	staticLabelName = "static"
-	// Metric label used for server identification.
-	serverLabelName = "server"
-)
+// The name of the exporter.
+const exporterName = "postgres_exporter"
+
+type collectorFlagSet map[string]*bool
+
+type pgStatStatementsFlags struct {
+	includeQuery     *bool
+	queryLength      *uint
+	limit            *uint
+	excludeDatabases *string
+	excludeUsers     *string
+}
+
+func newCollectorFlags() collectorFlagSet {
+	defaults := config.DefaultCollectorConfig()
+	names := make([]string, 0, len(defaults))
+	for name := range defaults {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	flags := make(collectorFlagSet, len(defaults))
+	for _, name := range names {
+		helpDefaultState := "disabled"
+		if defaults[name] {
+			helpDefaultState = "enabled"
+		}
+		flags[name] = kingpin.Flag(
+			"collector."+name,
+			fmt.Sprintf("Enable the %s collector (default: %s).", name, helpDefaultState),
+		).Default(fmt.Sprintf("%v", defaults[name])).Bool()
+	}
+	return flags
+}
+
+func newPGStatStatementsFlags() pgStatStatementsFlags {
+	return pgStatStatementsFlags{
+		includeQuery: kingpin.Flag(
+			"collector.stat_statements.include_query",
+			"Enable selecting statement query together with queryId. (default: disabled)",
+		).Default(strconv.FormatBool(config.DefaultPGStatStatementsIncludeQuery)).Bool(),
+		queryLength: kingpin.Flag(
+			"collector.stat_statements.query_length",
+			"Maximum length of the statement text.",
+		).Default(strconv.FormatUint(uint64(config.DefaultPGStatStatementsQueryLength), 10)).Uint(),
+		limit: kingpin.Flag(
+			"collector.stat_statements.limit",
+			"Maximum number of statements to return.",
+		).Default(fmt.Sprintf("%d", config.DefaultPGStatStatementsLimit)).Uint(),
+		excludeDatabases: kingpin.Flag(
+			"collector.stat_statements.exclude_databases",
+			"Comma-separated list of database names to exclude. (default: none)",
+		).Default("").String(),
+		excludeUsers: kingpin.Flag(
+			"collector.stat_statements.exclude_users",
+			"Comma-separated list of user names to exclude. (default: none)",
+		).Default("").String(),
+	}
+}
 
 func main() {
 	kingpin.Version(version.Print(exporterName))
-	promlogConfig := &promlog.Config{}
-	flag.AddFlags(kingpin.CommandLine, promlogConfig)
+	promslogConfig := &promslog.Config{}
+	flag.AddFlags(kingpin.CommandLine, promslogConfig)
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
-	logger = promlog.New(promlogConfig)
-
-	// landingPage contains the HTML served at '/'.
-	// TODO: Make this nicer and more informative.
-	var landingPage = []byte(`<html>
-	<head><title>Postgres exporter</title></head>
-	<body>
-	<h1>Postgres exporter</h1>
-	<p><a href='` + *metricPath + `'>Metrics</a></p>
-	</body>
-	</html>
-	`)
+	logger = promslog.New(promslogConfig)
 
 	if *onlyDumpMaps {
-		dumpMaps()
+		exporter.DumpMaps()
 		return
 	}
 
-	dsn, err := getDataSources()
+	registry := prometheus.NewRegistry()
+	authHandler, err := config.NewHandler(registry)
 	if err != nil {
-		level.Error(logger).Log("msg", "Failed reading data sources", "err", err.Error())
+		logger.Error("Failed to create config handler", "err", err)
 		os.Exit(1)
 	}
 
-	if len(dsn) == 0 {
-		level.Error(logger).Log("msg", "Couldn't find environment variables describing the datasource to use")
+	if err := authHandler.ReloadAuthConfig(*configFile, logger); err != nil {
+		// This is not fatal, but it means that auth must be provided for every dsn.
+		logger.Warn("Error loading config", "err", err)
+	}
+
+	warnDeprecatedDataSourceEnvVars()
+
+	dsns, err := getDataSources(dataSourceOpts{
+		URI:      *datasourceURI,
+		URIFile:  *datasourceURIFile,
+		UserFile: *datasourceUserFile,
+		PassFile: *datasourcePassFile,
+	})
+	if err != nil {
+		logger.Error("Failed reading data sources", "err", err.Error())
 		os.Exit(1)
 	}
 
-	opts := []ExporterOpt{
-		DisableDefaultMetrics(*disableDefaultMetrics),
-		DisableSettingsMetrics(*disableSettingsMetrics),
-		AutoDiscoverDatabases(*autoDiscoverDatabases),
-		WithUserQueriesPath(*queriesPath),
-		WithConstantLabels(*constantLabelsList),
-		ExcludeDatabases(*excludeDatabases),
-		IncludeDatabases(*includeDatabases),
+	cfg, err := buildConfig(dsns)
+	if err != nil {
+		logger.Error("Failed building config", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("Excluded databases", "databases", fmt.Sprintf("%v", cfg.ExcludeDatabases))
+
+	if cfg.UserQueriesPath != "" {
+		logger.Warn("The extended queries.yaml config is DEPRECATED", "file", cfg.UserQueriesPath)
 	}
 
-	exporter := NewExporter(dsn, opts...)
+	if cfg.AutoDiscoverDatabases || *excludeDatabases != "" || *includeDatabases != "" {
+		logger.Warn("Scraping additional databases via auto discovery is DEPRECATED")
+	}
+
+	if cfg.ConstantLabels != "" {
+		logger.Warn("Constant labels on all metrics is DEPRECATED")
+	}
+
+	validatedConfig, err := cfg.Validate()
+	if err != nil {
+		logger.Error("Invalid config", "err", err)
+		os.Exit(1)
+	}
+
+	pgRuntime, err := collector.NewRuntime(validatedConfig, logger)
+	if err != nil {
+		logger.Error("Failed to create runtime", "err", err)
+		os.Exit(1)
+	}
 	defer func() {
-		exporter.servers.Close()
+		if err := pgRuntime.Close(); err != nil {
+			logger.Error("Failed to close runtime", "err", err)
+		}
 	}()
 
-	prometheus.MustRegister(version.NewCollector(exporterName))
-
-	prometheus.MustRegister(exporter)
-
-	pe, err := collector.NewPostgresCollector(
-		logger,
-		dsn,
-		[]string{},
+	registry.MustRegister(
+		prometheuscollectors.NewGoCollector(),
+		prometheuscollectors.NewProcessCollector(prometheuscollectors.ProcessCollectorOpts{}),
+		versioncollector.NewCollector(exporterName),
 	)
+	for _, collector := range pgRuntime.Collectors() {
+		registry.MustRegister(collector)
+	}
+
+	http.Handle(*metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
+	if *metricsPath != "/" && *metricsPath != "" {
+		landingConfig := web.LandingConfig{
+			Name:        "Postgres Exporter",
+			Description: "Prometheus PostgreSQL server Exporter",
+			Version:     version.Info(),
+			Links: []web.LandingLinks{
+				{
+					Address: *metricsPath,
+					Text:    "Metrics",
+				},
+			},
+		}
+		landingPage, err := web.NewLandingPage(landingConfig)
+		if err != nil {
+			logger.Error("error creating landing page", "err", err)
+			os.Exit(1)
+		}
+		http.Handle("/", landingPage)
+	}
+
+	http.HandleFunc("/probe", handleProbe(logger, authHandler, cfg))
+	http.HandleFunc("/-/reload", handleReload(authHandler, *configFile))
+
+	reloadSignals := make(chan os.Signal, 1)
+	signal.Notify(reloadSignals, syscall.SIGHUP)
+	defer signal.Stop(reloadSignals)
+	go handleReloadSignal(reloadSignals, authHandler, *configFile, logger)
+
+	srv := &http.Server{}
+	if err := web.ListenAndServe(srv, webConfig, logger); err != nil {
+		logger.Error("Error running HTTP server", "err", err)
+		os.Exit(1)
+	}
+}
+
+func buildConfig(dsns []string) (config.Config, error) {
+	parsedCollectionTimeout, err := parseCollectionTimeout(*collectionTimeout)
 	if err != nil {
-		level.Error(logger).Log("msg", "Failed to create PostgresCollector", "err", err.Error())
-		os.Exit(1)
+		return config.Config{}, err
 	}
-	prometheus.MustRegister(pe)
 
-	http.Handle(*metricPath, promhttp.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=UTF-8") // nolint: errcheck
-		w.Write(landingPage)                                       // nolint: errcheck
-	})
-
-	level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
-	srv := &http.Server{Addr: *listenAddress}
-	if err := web.ListenAndServe(srv, *webConfig, logger); err != nil {
-		level.Error(logger).Log("msg", "Error running HTTP server", "err", err)
-		os.Exit(1)
+	cfg := config.NewConfigWithDefaults()
+	cfg.DataSourceNames = dsns
+	cfg.MetricPrefix = *metricPrefix
+	cfg.CollectionTimeout = parsedCollectionTimeout
+	cfg.WrapLargeCounters = *wrapLargeCounters
+	cfg.DisableDefaultMetrics = *disableDefaultMetrics
+	cfg.AutoDiscoverDatabases = *autoDiscoverDatabases
+	cfg.AutoDiscoverDatabasesMaxConcurrency = *autoDiscoverDatabasesMaxConcurrency
+	cfg.UserQueriesPath = *queriesPath
+	cfg.ConstantLabels = *constantLabelsList
+	cfg.ExcludeDatabases = splitList(*excludeDatabases)
+	cfg.IncludeDatabases = splitList(*includeDatabases)
+	cfg.Collectors = collectorFlags.states()
+	cfg.LongRunningTransactions = config.LongRunningTransactionsConfig{
+		Threshold: *longRunningTransactionsThreshold,
 	}
+	cfg.PGStatStatements = config.PGStatStatementsConfig{
+		IncludeQuery:     *statStatementsFlags.includeQuery,
+		QueryLength:      *statStatementsFlags.queryLength,
+		Limit:            *statStatementsFlags.limit,
+		ExcludeDatabases: splitList(*statStatementsFlags.excludeDatabases),
+		ExcludeUsers:     splitList(*statStatementsFlags.excludeUsers),
+	}
+	return cfg, nil
+}
+
+func (flags collectorFlagSet) states() map[string]bool {
+	states := make(map[string]bool, len(flags))
+	for name, value := range flags {
+		states[name] = *value
+	}
+	return states
+}
+
+func splitList(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	values := strings.Split(value, ",")
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func parseCollectionTimeout(value string) (time.Duration, error) {
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid collection timeout %q: %w", value, err)
+	}
+	return duration, nil
 }

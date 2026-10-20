@@ -1,7 +1,263 @@
-## master / unreleased
+## main / (unreleased)
 
-* [CHANGE] pg_stat_bgwriter counter metrics had the `_total` suffix added #556
+* [BUGFIX] Add unit-correct `pg_database_wraparound_age_datfrozenxid` and `pg_database_wraparound_age_datminmxid` gauges. The existing `_seconds` metrics remain as deprecated aliases with unchanged ID-count values; migrate dashboards, rules, and alerts to the new names.
+
+**WARNING: upgrading with large counters can cause a one-time false rate spike.**
+Non-negative 64-bit counters are now wrapped at `2^53` by default so that
+single-unit changes remain representable as `float64`. On the first scrape
+after an upgrade, a previous value such as `2^53 + 1,234,567` becomes
+`1,234,567`. Prometheus interprets that decrease as a counter reset and counts
+the remainder as post-reset growth, so `rate()` and `increase()` can report a
+large false spike for that evaluation window. Use
+`--no-wrap-large-counters` to preserve the previous conversion during rollout;
+enabling wrapping later will still create this one-time reset boundary.
+
+**DEPRECATION: the `DATA_SOURCE_*` environment variables that now have a flag.**
+Each one below keeps working and still takes effect when its flag is unset, but
+the exporter logs a warning on startup and they will be removed in v0.22.0.
+
+| Deprecated env var | Replacement |
+| --- | --- |
+| `DATA_SOURCE_URI` | `--datasource.uri` |
+| `DATA_SOURCE_URI_FILE` | `--datasource.uri-file` |
+| `DATA_SOURCE_USER_FILE` | `--datasource.user-file` |
+| `DATA_SOURCE_PASS_FILE` | `--datasource.pass-file` |
+
+`DATA_SOURCE_NAME`, `DATA_SOURCE_USER` and `DATA_SOURCE_PASS` are **not**
+deprecated and get no flag: they carry secrets, and CLI flags are readable via
+`/proc` and the Kubernetes API. Pass those by environment variable, or point
+the `-file` flags at a mounted secret.
+
+* [CHANGE] Add `--datasource.*` CLI flags for the Postgres connection config and deprecate the `DATA_SOURCE_*` environment variables they replace by @nicolastakashi in https://github.com/prometheus-community/postgres_exporter/pull/1376
+* [CHANGE] Wrap non-negative 64-bit counters at `2^53` to preserve single-unit precision by @gnanirahulnutakki in https://github.com/prometheus-community/postgres_exporter/pull/1351
+* [CHANGE] stat_replication: add `pid` label to disambiguate replication connections that otherwise share identical labels by @sysadmind in https://github.com/prometheus-community/postgres_exporter/pull/1353
+* [BUGFIX] Fix `long_running_transactions` to count only transactions older than a configurable threshold, by @ArthurSens in https://github.com/prometheus-community/postgres_exporter/pull/1379, based on the contribution by @moreinhardt in https://github.com/prometheus-community/postgres_exporter/pull/1210
+* [BUGFIX] Fix the `wal` collector failing on every scrape on Amazon Aurora PostgreSQL versions that don't support `pg_ls_waldir()` by @megative in https://github.com/prometheus-community/postgres_exporter/pull/1312
+* [FEATURE] Export `pg_settings.pending_restart` as `pg_settings_pending_restart{name}` from the `settings` collector by @MarcWort in https://github.com/prometheus-community/postgres_exporter/pull/1396
+* [FEATURE] Add `aurora_replica_status` collector for Amazon Aurora PostgreSQL by @megative in https://github.com/prometheus-community/postgres_exporter/pull/1311
+* [FEATURE] Add `aurora_global_db_status` collector for Amazon Aurora PostgreSQL by @megative in https://github.com/prometheus-community/postgres_exporter/pull/1410
+* [FEATURE] Add `aurora_stat_logical_wal_cache` collector for Amazon Aurora PostgreSQL by @megative in https://github.com/prometheus-community/postgres_exporter/pull/1414
+* [BUGFIX] Fix the `replication` collector failing on every scrape on Amazon Aurora PostgreSQL, where it now reports only `pg_replication_is_replica`, by @megative in https://github.com/prometheus-community/postgres_exporter/pull/1424, based on the contribution by @dannotripp in https://github.com/prometheus-community/postgres_exporter/pull/1274
+
+## 0.20.1 / 2026-07-07
+
+* [BUGFIX] stat_replication: fix "slot_name does not exist" by joining `pg_replication_slots` by @megative in https://github.com/prometheus-community/postgres_exporter/pull/1313
+
+## 0.20.0 / 2026-06-29
+
+BREAKING CHANGES:
+
+### Collector flag changes
+
+The `replication_slot` collector has been renamed to `replication_slots`.
+Users explicitly enabling or disabling this collector must update their flags:
+* `--collector.replication_slot` -> `--collector.replication_slots`
+* `--no-collector.replication_slot` -> `--no-collector.replication_slots`
+The `--disable-settings-metrics` flag and
+`PG_EXPORTER_DISABLE_SETTINGS_METRICS` environment variable have been removed.
+Use `--no-collector.settings` instead.
+
+### Metric name changes
+
+The metrics previously exposed by the `replication_slot` collector have been
+renamed to use the `pg_replication_slots_` prefix. Update alerts, recording
+rules, and dashboards that reference these metrics:
+* `pg_replication_slot_slot_current_wal_lsn` -> `pg_replication_slots_slot_current_wal_lsn`
+* `pg_replication_slot_slot_confirmed_flush_lsn` -> `pg_replication_slots_slot_confirmed_flush_lsn`
+* `pg_replication_slot_slot_is_active` -> `pg_replication_slots_slot_is_active`
+* `pg_replication_slot_safe_wal_size_bytes` -> `pg_replication_slots_safe_wal_size_bytes`
+* `pg_replication_slot_wal_status` -> `pg_replication_slots_wal_status`
+
+### Standalone collector behavior
+
+The `settings`, `stat_activity`, `stat_archiver`, `stat_replication`, and
+`replication_slots` metrics now come from standalone collectors instead of the
+legacy default metric map.
+These metrics no longer honor `--metric-prefix`, no longer include deprecated
+`constantLabels`, and are no longer disabled by `--disable-default-metrics`.
+To stop collecting them, disable the corresponding collector explicitly with
+its `--no-collector.*` flag.
+
+* [CHANGE] Move `pg_settings` metrics to the standalone `settings` collector by @ArthurSens in https://github.com/prometheus-community/postgres_exporter/pull/1303
+* [CHANGE] Move `stat_archiver` metrics to a standalone collector by @ArthurSens in https://github.com/prometheus-community/postgres_exporter/pull/1304
+* [CHANGE] Move `stat_activity` metrics to a standalone collector by @ArthurSens in https://github.com/prometheus-community/postgres_exporter/pull/1305
+* [CHANGE] Move `stat_replication` metrics to a standalone collector by @ArthurSens in https://github.com/prometheus-community/postgres_exporter/pull/1306
+* [CHANGE] Rename `replication_slot` to `replication_slots` and move replication slot metrics to a standalone collector by @ArthurSens in https://github.com/prometheus-community/postgres_exporter/pull/1307
+* [ENHANCEMENT] Publish container images to GHCR and update PromCI release automation by @roidelapluie in https://github.com/prometheus-community/postgres_exporter/pull/1322
+* [BUGFIX] Fix duplicate `pg_stat_progress_vacuum` metrics for cross-database vacuums by @steinbrueckri in https://github.com/prometheus-community/postgres_exporter/pull/1262
+* [BUGFIX] Fix `pg_settings` collection when `short_desc` is NULL by @jun-gradial in https://github.com/prometheus-community/postgres_exporter/pull/1327
+
+## 0.19.1 / 2026-02-25
+
+* [CHANGE] Filter and warn about duplicates in pg_stat_statements (#998) by @Nudin in https://github.com/prometheus-community/postgres_exporter/pull/1259
+* [ENHANCEMENT] perf/reliability: Optimize pg_stat_statements queries that uses too many temp files by @eugercek in https://github.com/prometheus-community/postgres_exporter/pull/1267
+* [BUGFIX] fix: ignore setting `google_dataplex.max_messages` by @cristiangreco in https://github.com/prometheus-community/postgres_exporter/pull/1261
+* [BUGFIX] wal: Fix collector NULL SUM(size) by @dannotripp in https://github.com/prometheus-community/postgres_exporter/pull/1265
+
+## 0.19.0 / 2026-02-03
+
+* [CHANGE] Reorganize code to remove the main package by @cristiangreco in https://github.com/prometheus-community/postgres_exporter/pull/1238
+* [FEATURE] Allow setting `limit` in `pg_stat_statements` collector by @cristiangreco in https://github.com/prometheus-community/postgres_exporter/pull/1205
+* [FEATURE] Allow excluding databases or users names in `stat_statements` collector by @cristiangreco in https://github.com/prometheus-community/postgres_exporter/pull/1232
+* [ENHANCEMENT] Enable pprof endpoints for profiling by @SuperQ in https://github.com/prometheus-community/postgres_exporter/pull/1212
+* [ENHANCEMENT] Document `stat_checkpointer` collector option by @fabiorueda in https://github.com/prometheus-community/postgres_exporter/pull/1226
+* [ENHANCEMENT] Ensure collection of stats succeed in a maximum duration to avoid exhausting PG connections by @pierresouchay in https://github.com/prometheus-community/postgres_exporter/pull/1229
+* [BUGFIX] Fix NULL handling on `long_running_transactions` collector by @sysadmind in https://github.com/prometheus-community/postgres_exporter/pull/1230
+* [BUGFIX] Do not crash on bad `pg_settings` value by @sysadmind in https://github.com/prometheus-community/postgres_exporter/pull/1252
+
+## 0.18.1 / 2025-09-29
+
+* [BUGFIX] Fix swapped `flushedLsn` and `receiveStartTli` for `wal_receiver` collector by @spantaleev in https://github.com/prometheus-community/postgres_exporter/pull/1198
+* [BUGFIX] Fix superfluous semicolon breaking query in `process_idle` by @sysadmind in https://github.com/prometheus-community/postgres_exporter/pull/1197 and https://github.com/prometheus-community/postgres_exporter/pull/1201
+
+## 0.18.0 / 2025-09-25
+
+* [FEATURE] Add `stat_progress_vacuum` collector by @ianbibby in https://github.com/prometheus-community/postgres_exporter/pull/1141
+* [FEATURE] Add `buffercache_summary` collector by @sfc-gh-pnuttall in https://github.com/prometheus-community/postgres_exporter/pull/1165
+* [FEATURE] `stat_statements`: export query itself together with `queryId` by @Delorien84 in https://github.com/prometheus-community/postgres_exporter/pull/940
+* [ENHANCEMENT] Improve error handling for `Server.Scrape` by @BoweFlex in https://github.com/prometheus-community/postgres_exporter/pull/1158
+* [ENHANCEMENT] `stat_user_tables`: record table-only size bytes in addition to the total size bytes by @Sticksman Sticksman in https://github.com/prometheus-community/postgres_exporter/pull/1149
+* [ENHANCEMENT] (chore) Fix a typo and use `slices.Contains` by @cristiangreco in https://github.com/prometheus-community/postgres_exporter/pull/1176
+* [ENHANCEMENT] Update mixin to latest changes from `grafana/postgres_exporter` by @cristiangreco, @gaantunes, @v-zhuravlev and @mshahzeb in https://github.com/prometheus-community/postgres_exporter/pull/1179
+* [ENHANCEMENT] Exclude the metrics fetching session's data from pg_stat_activity by @kmoppel in https://github.com/prometheus-community/postgres_exporter/pull/1185
+* [BUGFIX] Ensure database connections are always closed by @cristiangreco and @dehaansa in https://github.com/prometheus-community/postgres_exporter/pull/1177
+* [BUGFIX] Fix superfluous semicolon breaking query in `process_idle` by @sysadmind in https://github.com/prometheus-community/postgres_exporter/pull/1197
+
+## 0.17.1 / 2025-02-26
+
+* [BUGFIX] Fix: Handle incoming labels with invalid UTF-8 #1131
+
+## 0.17.0 / 2025-02-16
+
+## What's Changed
+* [ENHANCEMENT] Add Postgres 17 for CI test by @khiemdoan in https://github.com/prometheus-community/postgres_exporter/pull/1105
+* [ENHANCEMENT] Add wait/backend to pg_stat_activity by @fgalind1 in https://github.com/prometheus-community/postgres_exporter/pull/1106
+* [ENHANCEMENT] Export last replay age in replication collector by @bitfehler in https://github.com/prometheus-community/postgres_exporter/pull/1085
+* [BUGFIX] Fix pg_long_running_transactions time by @jyothikirant-sayukth in https://github.com/prometheus-community/postgres_exporter/pull/1092
+* [BUGFIX] Fix to replace dashes with underscore in the metric names by @aagarwalla-fx in https://github.com/prometheus-community/postgres_exporter/pull/1103
+* [BIGFIX] Checkpoint related columns in PG 17 have been moved from pg_stat_bgwriter to pg_stat_checkpointer by @n-rodriguez in https://github.com/prometheus-community/postgres_exporter/pull/1072
+* [BUGFIX] Fix pg_stat_statements for PG17 by @NevermindZ4 in https://github.com/prometheus-community/postgres_exporter/pull/1114
+* [BUGFIX] Handle pg_replication_slots on pg<13 by @michael-todorovic in https://github.com/prometheus-community/postgres_exporter/pull/1098
+* [BUGFIX] Fix missing dsn sanitization for logging by @sysadmind in https://github.com/prometheus-community/postgres_exporter/pull/1104
+
+## New Contributors
+* @jyothikirant-sayukth made their first contribution in https://github.com/prometheus-community/postgres_exporter/pull/1092
+* @aagarwalla-fx made their first contribution in https://github.com/prometheus-community/postgres_exporter/pull/1103
+* @NevermindZ4 made their first contribution in https://github.com/prometheus-community/postgres_exporter/pull/1114
+* @michael-todorovic made their first contribution in https://github.com/prometheus-community/postgres_exporter/pull/1098
+* @fgalind1 made their first contribution in https://github.com/prometheus-community/postgres_exporter/pull/1106
+
+**Full Changelog**: https://github.com/prometheus-community/postgres_exporter/compare/v0.16.0...v0.17.0
+
+## 0.16.0 / 2024-11-10
+
+BREAKING CHANGES:
+
+The logging system has been replaced with log/slog from the stdlib. This change is being made across the prometheus ecosystem. The logging output has changed, but the messages and levels remain the same. The `ts` label for the timestamp has bewen replaced with `time`, the accuracy is less, and the timezone is not forced to UTC. The `caller` field has been replaced by the `source` field, which now includes the full path to the source file. The `level` field now exposes the log level in capital letters.
+
+* [CHANGE] Replace logging system #1073
+* [ENHANCEMENT] Add save_wal_size and wal_status to replication_slot collector #1027
+* [ENHANCEMENT] Add roles collector and connection limit metrics to database collector #997
+* [ENHANCEMENT] Excluded databases log messgae is now info level #1003
+* [ENHANCEMENT] Add active_time to stat_database collector #961
+* [ENHANCEMENT] Add slot_type label to replication_slot collector #960
+* [BUGFIX] Fix walreceiver collectore when no repmgr #1086
+* [BUGFIX] Remove logging errors on replicas #1048
+* [BUGFIX] Fix active_time query on postgres>=14 #1045
+
+## 0.15.0 / 2023-10-27
+
+* [ENHANCEMENT] Add 1kB and 2kB units #915
+* [BUGFIX] Add error log when probe collector creation fails #918
+* [BUGFIX] Fix test build failures on 32-bit arch #919
+* [BUGFIX] Adjust collector to use separate connection per scrape #936
+
+## 0.14.0 / 2023-09-11
+
+* [CHANGE] Add `state` label to pg_process_idle_seconds #862
+* [CHANGE] Change database connections to one per scrape #882 #902
+* [ENHANCEMENT] Add wal collector #858
+* [ENHANCEMENT] Add database_wraparound collector #834
+* [ENHANCEMENT] Add stat_activity_autovacuum collector #840
+* [ENHANCEMENT] Add stat_wal_receiver collector #844
+* [ENHANCEMENT] Add xlog_location collector #849
+* [ENHANCEMENT] Add statio_user_indexes collector #845
+* [ENHANCEMENT] Add long_running_transactions collector #836
+* [ENHANCEMENT] Add pg_stat_user_tables_size_bytes metric #904
+* [BUGFIX] Fix tests on 32-bit systems #857
+* [BUGFIX] Fix pg_stat_statements metrics on Postgres 13+ #874 #876
+* [BUGFIX] Fix pg_stat_database metrics for NULL stats_reset #877
+* [BUGFIX] Fix pg_replication_lag_seconds on Postgres 10+ when master is idle #895
+
+## 0.13.2 / 2023-07-21
+
+* [BUGFIX] Fix type issues on pg_postmaster metrics #828
+* [BUGFIX] Fix pg_replication collector instantiation #854
+* [BUGFIX] Fix pg_process_idle metrics #855
+
+## 0.13.1 / 2023-06-27
+
+* [BUGFIX] Make collectors not fail on null values #823
+
+## 0.13.0 / 2023-06-21
+
+BREAKING CHANGES:
+
+Please note, the following features are deprecated and may be removed in a future release:
+- `auto-discover-databases`
+- `extend.query-path`
+- `constantLabels`
+- `exclude-databases`
+- `include-databases`
+
+This exporter is meant to monitor PostgresSQL servers, not the user data/databases. If
+you need a generic SQL report exporter https://github.com/burningalchemist/sql_exporter
+is recommended.
+
+* [CHANGE] Adjust log level for collector startup #784
+* [CHANGE] Move queries from queries.yaml to collectors #801
+* [CHANGE] Deprecate extend queries feature #811
+* [CHANGE] Deprecate additional database features #815
+* [CHANGE] Convert pg_stat_database to new collector #685
+* [ENHANCEMENT] Supports alternate postgres:// prefix in URLs #787
+* [BUGFIX] Fix pg_setting different help values #771
+* [BUGFIX] Fix column type for pg_replication_slots #777
+* [BUGFIX] Fix pg_stat_database collector #809
+
+## 0.12.1 / 2023-06-12
+* [BUGFIX] Fix column type for pg_replication_slots #777
+
+## 0.12.0 / 2023-03-21
+
+BREAKING CHANGES:
+
+This release changes support for multiple postgres servers to use the
+multi-target exporter pattern. This makes it much easier to monitor multiple
+PostgreSQL servers from a single exporter by passing the target via URL
+params. See the Multi-Target Support section of the README.
+
+* [CHANGE] Add multi-target support #618
+* [CHANGE] Add usename and application_name to pg_stat_activity metrics #673
+* [FEATURE] Add replication metrics from pg_replication_slots #747
+* [BUGFIX] Add dsn type for handling datasources #678
+* [BUGFIX] Add 64kB unit for postgres 15 #740
+* [BUGFIX] Add 4kB unit for postgres compiled with small blocks #699
+
+## 0.11.1 / 2022-08-01
+
+* [BUGFIX] Fix checkpoint_write_time value type #666
+* [BUGFIX] Fix checkpoint_sync_time value type #667
+
+## 0.11.0 / 2022-07-28
+
+NOTE: pg_stat_bgwriter counter metrics had the `_total` suffix added #556
+
+* [CHANGE] refactor pg_stat_bgwriter metrics into standalone collector #556
+* [FEATURE] Add pg_database collector #613
 * [ENHANCEMENT] Add pg_database_size_bytes metric #613
+* [BUGFIX] Avoid parsing error from bogus Azure Flexible Server custom GUC #587
+* [BUGFIX] Fix pg_stat_archiver error in 9.4 and earlier. #599
+* [BUGFIX] Sanitize setting values because of Aurora irregularity #620
 
 ## 0.10.1 / 2022-01-14
 

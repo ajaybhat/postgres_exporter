@@ -1,0 +1,130 @@
+// Copyright 2023 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package collector
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"regexp"
+
+	"github.com/blang/semver/v4"
+	"github.com/prometheus-community/postgres_exporter/config"
+)
+
+type instance struct {
+	dsn               string
+	db                *sql.DB
+	version           semver.Version
+	database          string
+	wrapLargeCounters bool
+	// isAurora reports whether the server is Amazon Aurora PostgreSQL.
+	// Aurora-specific collectors return ErrNoData when it is false.
+	isAurora bool
+}
+
+// copy returns a copy of the instance.
+func (i *instance) copy() *instance {
+	return &instance{
+		dsn:               i.dsn,
+		wrapLargeCounters: i.wrapLargeCounters,
+	}
+}
+
+// withDatabase returns a new, unconnected instance whose dsn points at
+// database instead of whichever database i's dsn originally targeted. It is
+// used to scrape a database discovered alongside i's own primary connection,
+// on the same PostgreSQL server.
+func (i *instance) withDatabase(database string) (*instance, error) {
+	dsn, err := config.NewDSN(i.dsn)
+	if err != nil {
+		return nil, fmt.Errorf("malformed dsn: %w", err)
+	}
+	other := &instance{
+		dsn:               dsn.WithDatabase(database).GetConnectionString(),
+		wrapLargeCounters: i.wrapLargeCounters,
+		// database is on the same PostgreSQL server as i, so it runs the same
+		// version; skip re-querying it over the new connection.
+		version: i.version,
+	}
+	return other, nil
+}
+
+func (i *instance) setup(ctx context.Context) error {
+	db, err := sql.Open("postgres", i.dsn)
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	i.db = db
+
+	if i.version.EQ(semver.Version{}) {
+		version, err := queryVersion(ctx, i.db)
+		if err != nil {
+			return fmt.Errorf("error querying postgresql version: %w", err)
+		}
+		i.version = version
+	}
+
+	// aurora_version() only exists on Amazon Aurora PostgreSQL. to_regproc
+	// returns NULL instead of raising an error when it is missing, so the
+	// check doesn't log errors on regular PostgreSQL servers.
+	if err := i.db.QueryRowContext(ctx, "SELECT current_database(), to_regproc('aurora_version') IS NOT NULL").Scan(&i.database, &i.isAurora); err != nil {
+		return fmt.Errorf("error querying current database: %w", err)
+	}
+	return nil
+}
+
+func (i *instance) getDB() *sql.DB {
+	return i.db
+}
+
+func (i *instance) Close() error {
+	if i.db == nil {
+		return nil
+	}
+	err := i.db.Close()
+	i.db = nil
+	return err
+}
+
+// Regex used to get the "short-version" from the postgres version field.
+// The result of SELECT version() is something like "PostgreSQL 9.6.2 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 6.2.1 20160830, 64-bit"
+var versionRegex = regexp.MustCompile(`^\w+ ((\d+)(\.\d+)?(\.\d+)?)`)
+var serverVersionRegex = regexp.MustCompile(`^((\d+)(\.\d+)?(\.\d+)?)`)
+
+func queryVersion(ctx context.Context, db *sql.DB) (semver.Version, error) {
+	var version string
+	err := db.QueryRowContext(ctx, "SELECT version();").Scan(&version)
+	if err != nil {
+		return semver.Version{}, err
+	}
+	submatches := versionRegex.FindStringSubmatch(version)
+	if len(submatches) > 1 {
+		return semver.ParseTolerant(submatches[1])
+	}
+
+	// We could also try to parse the version from the server_version field.
+	// This is of the format 13.3 (Debian 13.3-1.pgdg100+1)
+	err = db.QueryRowContext(ctx, "SHOW server_version;").Scan(&version)
+	if err != nil {
+		return semver.Version{}, err
+	}
+	submatches = serverVersionRegex.FindStringSubmatch(version)
+	if len(submatches) > 1 {
+		return semver.ParseTolerant(submatches[1])
+	}
+	return semver.Version{}, fmt.Errorf("could not parse version from %q", version)
+}
